@@ -1,12 +1,15 @@
 import json
 import re
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
+
+import extruct
 from bs4 import BeautifulSoup
 
-# Image extensions we consider real product images
+# Image extensions we consider real product images (for <img> tag filtering only)
 _IMAGE_EXTENSIONS = re.compile(r'\.(jpg|jpeg|png|webp|avif)(\?|$)', re.IGNORECASE)
 
-# URL fragments that indicate UI/chrome images rather than product images
+# URL fragments that indicate UI/chrome images — applied to all sources
 _NOISE_PATTERNS = re.compile(
     r'(\.svg|/resources/|/icons?/|logo|favicon|spinner|loading|blank\.gif|analytics)',
     re.IGNORECASE,
@@ -14,25 +17,50 @@ _NOISE_PATTERNS = re.compile(
 
 
 def _is_product_image(url: str) -> bool:
-    """Return True if the URL looks like a real product image, not UI chrome."""
+    """Full check for <img> tag URLs: requires a known image extension and no noise patterns."""
     return bool(_IMAGE_EXTENSIONS.search(url)) and not _NOISE_PATTERNS.search(url)
 
 
-def _walk_json_ld_images(data: object, seen: set[str], out: list[str]) -> None:
-    """Recursively walk a JSON-LD object and collect all image URLs."""
+def _is_structured_image(url: str) -> bool:
+    """Relaxed check for structured data images (JSON-LD, microdata, og:image).
+
+    Structured data images are always intentionally set by the site, so we
+    skip the extension requirement and only filter obvious noise.
+    """
+    return bool(url) and not _NOISE_PATTERNS.search(url)
+
+
+def _normalize_url(url: str) -> str:
+    """Normalize a URL for deduplication and display.
+
+    - Promotes protocol-relative URLs (//host/path) to https://
+    - Strips query params so CDN variants of the same asset collapse to one key
+    """
+    if url.startswith("//"):
+        url = "https:" + url
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def _walk_for_images(data: object, seen: set[str], out: list[str], _in_image_key: bool = False) -> None:
+    """Recursively walk any JSON-like structure and collect structured data image URLs.
+
+    Strings are only collected when nested inside an 'image'/'images' key so that
+    non-URL string values (product names, types, etc.) are not mistakenly included.
+    """
     if isinstance(data, str):
-        if _is_product_image(data) and data not in seen:
-            seen.add(data)
-            out.append(data)
+        if _in_image_key:
+            normalized = _normalize_url(data)
+            if _is_structured_image(normalized) and normalized not in seen:
+                seen.add(normalized)
+                out.append(normalized)
     elif isinstance(data, list):
         for item in data:
-            _walk_json_ld_images(item, seen, out)
+            _walk_for_images(item, seen, out, _in_image_key)
     elif isinstance(data, dict):
         for key, value in data.items():
-            if key.lower() in ("image", "images"):
-                _walk_json_ld_images(value, seen, out)
-            else:
-                _walk_json_ld_images(value, seen, out)
+            is_image_key = key.lower() in ("image", "images", "image_url", "imageurl")
+            _walk_for_images(value, seen, out, is_image_key)
 
 
 def preprocess(html: str) -> str:
@@ -40,99 +68,160 @@ def preprocess(html: str) -> str:
     Strip a raw HTML page down to a plain text payload for LLM extraction.
 
     Output sections:
-      [STRUCTURED DATA]  — JSON-LD blocks found in the page
+      [STRUCTURED DATA]  — JSON-LD and microdata blocks found in the page
       [IMAGES]           — deduplicated product image URLs
+      [VIDEO]            — video URL if found in OpenGraph
       [CONTENT]          — visible text after stripping noise tags
     """
     soup = BeautifulSoup(html, "lxml")
     seen: set[str] = set()
 
-    # --- 1. Extract JSON-LD before stripping scripts ---
-    json_ld_blocks = []
-    json_ld_image_urls: list[str] = []
-    for tag in soup.find_all("script", type="application/ld+json"):
+    # --- 1. Extract all structured data via extruct ---
+    # Handles JSON-LD, Schema.org microdata, and OpenGraph in one pass
+    extracted = extruct.extract(
+        html,
+        syntaxes=["json-ld", "microdata", "opengraph"],
+        uniform=True,
+        errors="ignore",
+    )
+
+    # --- 2. Build [STRUCTURED DATA] from JSON-LD and microdata ---
+    structured_blocks = []
+    for item in extracted.get("json-ld", []) + extracted.get("microdata", []):
+        structured_blocks.append(json.dumps(item, indent=2))
+
+    # --- 3. Walk structured data recursively for image URLs ---
+    structured_image_urls: list[str] = []
+    _walk_for_images(extracted.get("json-ld", []), seen, structured_image_urls)
+    _walk_for_images(extracted.get("microdata", []), seen, structured_image_urls)
+
+    # --- 4. OpenGraph: images as fallback, video for video_url field ---
+    og_image_urls: list[str] = []
+    video_url: str | None = None
+    for og in extracted.get("opengraph", []):
+        og_img = (og.get("og:image") or "").strip()
+        if og_img:
+            normalized = _normalize_url(og_img)
+            if _is_structured_image(normalized) and normalized not in seen:
+                seen.add(normalized)
+                og_image_urls.append(normalized)
+        if not video_url:
+            video_url = og.get("og:video") or og.get("og:video:url")
+
+    # --- 5. __NEXT_DATA__ for NextJS sites (not handled by extruct) ---
+    # Recursively find the product node in pageProps to surface variants/colors to the LLM.
+    # Walk for images when JSON-LD images are sparse.
+    _PRODUCT_KEYS = {"name", "price", "sku", "description", "variants", "variantName", "relatedProducts", "items"}
+
+    def _find_product_node(obj: object, depth: int = 0) -> dict | None:
+        if depth > 8 or not isinstance(obj, dict):
+            return None
+        if len(_PRODUCT_KEYS & obj.keys()) >= 3:
+            return obj
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                result = _find_product_node(v, depth + 1) if isinstance(v, dict) else next(
+                    (r for item in v if isinstance(item, dict) for r in [_find_product_node(item, depth + 1)] if r), None
+                )
+                if result:
+                    return result
+        return None
+
+    next_data_image_urls: list[str] = []
+    next_data_tag = soup.find("script", id="__NEXT_DATA__")
+    if next_data_tag:
         try:
-            data = json.loads(tag.string or "")
-            json_ld_blocks.append(json.dumps(data, indent=2))
-            _walk_json_ld_images(data, seen, json_ld_image_urls)
+            next_data = json.loads(next_data_tag.string or "")
+            # Always walk for images when structured data is sparse
+            if len(structured_image_urls) < 2:
+                _walk_for_images(next_data, seen, next_data_image_urls)
+            # Find and slim the product node for structured data
+            product_node = _find_product_node(next_data)
+            if product_node:
+                _KEEP_KEYS = {
+                    "name", "variantName", "sku", "description", "price", "priceAsNumber",
+                    "priceBeforeDiscount", "discountPercent", "showAsOnSale", "available",
+                }
+                slim = {k: v for k, v in product_node.items() if k in _KEEP_KEYS}
+                item_table = product_node.get("itemTable", {})
+                if item_table.get("x"):
+                    slim["sizes"] = item_table["x"]
+                base_sku = product_node.get("productSku", "")
+                related = product_node.get("relatedProducts", [])
+                if related:
+                    color_variants = [
+                        p.get("variantName") for p in related
+                        if isinstance(p, dict)
+                        and (not base_sku or p.get("productSku") == base_sku)
+                        and p.get("variantName")
+                    ]
+                    current_color = product_node.get("variantName")
+                    if current_color and current_color not in color_variants:
+                        color_variants.insert(0, current_color)
+                    if color_variants:
+                        slim["availableColors"] = color_variants
+                structured_blocks.append(json.dumps(slim, indent=2))
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # --- 2. OpenGraph meta tags (og:image fallback + og:video for video_url) ---
-    og_image_urls: list[str] = []
-    video_url: str | None = None
-    for meta in soup.find_all("meta"):
-        prop = meta.get("property", "") or meta.get("name", "")
-        content = (meta.get("content") or "").strip()
-        if not content:
-            continue
-        if prop == "og:image" and _is_product_image(content) and content not in seen:
-            seen.add(content)
-            og_image_urls.append(content)
-        elif prop == "og:video" and not video_url:
-            video_url = content
-
-    # --- 3. __NEXT_DATA__ script targeting (NextJS sites with no <img src>) ---
-    next_data_image_urls: list[str] = []
-    if len(json_ld_image_urls) < 2:
-        next_data_tag = soup.find("script", id="__NEXT_DATA__")
-        if next_data_tag:
-            try:
-                next_data = json.loads(next_data_tag.string or "")
-                _walk_json_ld_images(next_data, seen, next_data_image_urls)
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    # --- 4. Strip noise tags ---
+    # --- 6. Strip noise tags before img/text extraction ---
     for tag in soup.find_all(["script", "style", "nav", "footer", "header", "aside"]):
         tag.decompose()
 
-    # --- 5. Find main product container to scope <img> extraction ---
+    # --- 7. Scope <img> extraction to the main product container if possible ---
     product_scope = None
     for candidate in soup.find_all(True):
-        itemtype = candidate.get("itemtype", "")
-        if "schema.org/Product" in itemtype:
+        if "schema.org/Product" in (candidate.get("itemtype") or ""):
             product_scope = candidate
             break
     if product_scope is None:
         for candidate in soup.find_all(True):
-            testid = candidate.get("data-testid", "") or candidate.get("data-test", "")
-            if "product" in testid.lower():
+            testid = (candidate.get("data-testid") or candidate.get("data-test") or "").lower()
+            if "product" in testid:
                 product_scope = candidate
                 break
     img_search_root = product_scope if product_scope is not None else soup
 
-    # --- 6. Collect image URLs from <img> tags within product scope ---
+    # --- 8. Collect image URLs from <img> tags within the product scope ---
     img_tag_urls: list[str] = []
     for img in img_search_root.find_all("img"):
         for attr in ("src", "data-src", "data-lazy-src"):
-            url = img.get(attr, "").strip()
-            if url and _is_product_image(url) and url not in seen:
+            raw = img.get(attr, "").strip()
+            if not raw:
+                continue
+            url = _normalize_url(raw)
+            if _is_product_image(url) and url not in seen:
                 seen.add(url)
                 img_tag_urls.append(url)
 
         srcset = img.get("srcset", "").strip()
         if srcset:
             for part in srcset.split(","):
-                url = part.strip().split()[0]
-                if url and _is_product_image(url) and url not in seen:
+                raw = part.strip().split()[0]
+                if not raw:
+                    continue
+                url = _normalize_url(raw)
+                if _is_product_image(url) and url not in seen:
                     seen.add(url)
                     img_tag_urls.append(url)
 
-    # Merge in priority order: JSON-LD (intentional) → img tags → og:image → __NEXT_DATA__
+    # Merge in priority order: structured data → img tags → og:image → __NEXT_DATA__
     # Cap at 20 URLs to control token spend
-    image_urls = (json_ld_image_urls + img_tag_urls + og_image_urls + next_data_image_urls)[:20]
+    image_urls = (structured_image_urls + img_tag_urls + og_image_urls + next_data_image_urls)[:20]
 
-    # --- 7. Extract visible text ---
+    # --- 9. Extract visible text ---
+    # Truncate [CONTENT] to control token spend. Structured data covers the key fields;
+    # [CONTENT] is a fallback, so less is needed when structured data is rich.
+    content_limit = 2000 if structured_blocks else 5000
     text = soup.get_text(separator="\n", strip=True)
     lines = [line for line in text.splitlines() if line.strip()]
-    visible_text = "\n".join(lines)
+    visible_text = "\n".join(lines)[:content_limit]
 
-    # --- 8. Assemble payload ---
+    # --- 10. Assemble payload ---
     sections = []
 
-    if json_ld_blocks:
-        sections.append("[STRUCTURED DATA]\n" + "\n---\n".join(json_ld_blocks))
+    if structured_blocks:
+        sections.append("[STRUCTURED DATA]\n" + "\n---\n".join(structured_blocks))
 
     if image_urls:
         sections.append("[IMAGES]\n" + "\n".join(image_urls))

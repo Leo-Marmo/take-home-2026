@@ -35,6 +35,11 @@ class VariantOption(BaseModel):
     name: str   # e.g. "Color", "Size", "Voltage"
     value: str  # e.g. "Black", "10", "20V"
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, v: str) -> str:
+        return v.strip().title()
+
 
 class Variant(BaseModel):
     options: list[VariantOption]
