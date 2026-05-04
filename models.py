@@ -57,3 +57,8 @@ class Product(BaseModel):
     brand: str
     colors: list[str]
     variants: list[Variant]
+
+
+class ProductSummary(BaseModel):
+    id: str
+    product: Product
