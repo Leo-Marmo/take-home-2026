@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -12,9 +11,7 @@ from preprocessor import preprocess
 
 logger = logging.getLogger(__name__)
 
-# Default model per provider
-OLLAMA_MODEL = "llama3.2:latest"
-OPENROUTER_MODEL = "google/gemini-2.5-flash-lite"
+MODEL = "google/gemini-2.5-flash-lite"
 
 _category_matcher = CategoryMatcher()
 
@@ -63,11 +60,6 @@ Please fix the issue and try again.
 """
 
 
-def _get_model() -> str:
-    provider = os.environ.get("LLM_PROVIDER", "openrouter").lower()
-    return OLLAMA_MODEL if provider == "ollama" else OPENROUTER_MODEL
-
-
 async def extract(html: str, source: str) -> Product | None:
     """
     Extract a Product from raw HTML.
@@ -83,7 +75,6 @@ async def extract(html: str, source: str) -> Product | None:
     candidates = _category_matcher.match(payload)
     numbered = "\n".join(f"{i+1}. {c}" for i, c in enumerate(candidates))
     user_message = USER_PROMPT.format(candidate_categories=numbered, payload=payload)
-    model = _get_model()
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -93,16 +84,16 @@ async def extract(html: str, source: str) -> Product | None:
     # First attempt
     first_error = None
     try:
-        return await ai.responses(model=model, input=messages, text_format=Product)
-    except (ValidationError, Exception) as e:
+        return await ai.responses(model=MODEL, messages=messages, text_format=Product)
+    except Exception as e:
         first_error = e
         logger.warning(f"[{source}] First attempt failed: {e}")
 
     # Retry with validation error hint
     messages.append({"role": "user", "content": RETRY_SUFFIX.format(error=str(first_error))})
     try:
-        return await ai.responses(model=model, input=messages, text_format=Product)
-    except (ValidationError, Exception) as e:
+        return await ai.responses(model=MODEL, messages=messages, text_format=Product)
+    except Exception as e:
         logger.error(f"[{source}] Second attempt failed, skipping: {e}")
         return None
 

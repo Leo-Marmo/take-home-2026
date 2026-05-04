@@ -12,8 +12,12 @@ import { ErrorBanner, SectionHeader, OptionPill } from "@/components/common"
 
 function ImageGallery({ urls }: { urls: string[] }) {
   const [active, setActive] = useState(0)
+  const [failedUrls, setFailedUrls] = useState<Set<number>>(new Set())
 
-  if (urls.length === 0) {
+  const markFailed = (i: number) => setFailedUrls((prev) => new Set(prev).add(i))
+  const validUrls = urls.filter((_, i) => !failedUrls.has(i))
+
+  if (urls.length === 0 || validUrls.length === 0) {
     return (
       <div className="aspect-square w-full rounded-xl bg-muted flex items-center justify-center text-muted-foreground text-sm">
         No image
@@ -21,23 +25,26 @@ function ImageGallery({ urls }: { urls: string[] }) {
     )
   }
 
+  const safeActive = Math.min(active, validUrls.length - 1)
+
   return (
     <div className="space-y-3">
       <div className="aspect-square w-full overflow-hidden rounded-xl bg-muted">
         <img
-          src={urls[active]}
+          src={validUrls[safeActive]}
           alt="Product"
           className="h-full w-full object-cover"
+          onError={() => markFailed(urls.indexOf(validUrls[safeActive]))}
         />
       </div>
-      {urls.length > 1 && (
+      {validUrls.length > 1 && (
         <div className="flex gap-2 overflow-x-auto pb-1">
-          {urls.map((url, i) => (
+          {validUrls.map((url, i) => (
             <button
-              key={i}
+              key={url}
               onClick={() => setActive(i)}
               className={`shrink-0 w-16 h-16 rounded-lg overflow-hidden border-2 transition-colors ${
-                i === active ? "border-primary" : "border-transparent"
+                i === safeActive ? "border-primary" : "border-transparent"
               }`}
             >
               <img src={url} alt="" className="h-full w-full object-cover" />
@@ -56,9 +63,7 @@ function VariantSelector({
   variants: Variant[]
   onPriceChange: (price: Price | null) => void
 }) {
-  const _OPTION_ORDER: Record<string, number> = { Color: 0, Size: 1 }
-  const optionNames = [...new Set(variants.flatMap((v) => v.options.map((o) => o.name)))]
-    .sort((a, b) => (_OPTION_ORDER[a] ?? 99) - (_OPTION_ORDER[b] ?? 99))
+  const optionNames = [...new Set(variants.flatMap((v) => v.options.map((o) => o.name)))].sort()
   const [selections, setSelections] = useState<Record<string, string>>({})
 
   if (variants.length === 0 || optionNames.length === 0) return null

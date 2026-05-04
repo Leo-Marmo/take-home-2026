@@ -8,7 +8,7 @@ export function formatPrice(price: Price): string {
 }
 
 export function formatCompareAt(price: Price): string | null {
-  if (!price.compare_at_price) return null
+  if (!price.compare_at_price || price.compare_at_price <= price.price) return null
   return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: price.currency,

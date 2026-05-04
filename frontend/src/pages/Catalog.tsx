@@ -24,6 +24,8 @@ function ProductCard({ summary }: { summary: ProductSummary }) {
   const { id, product } = summary
   const image = product.image_urls[0]
   const compareAt = formatCompareAt(product.price)
+  const [imgError, setImgError] = useState(false)
+  const showImage = image && !imgError
 
   return (
     <Card
@@ -31,11 +33,12 @@ function ProductCard({ summary }: { summary: ProductSummary }) {
       onClick={() => navigate(`/products/${id}`)}
     >
       <div className="relative aspect-square overflow-hidden bg-muted">
-        {image ? (
+        {showImage ? (
           <img
             src={image}
             alt={product.name}
             className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+            onError={() => setImgError(true)}
           />
         ) : (
           <div className="flex h-full items-center justify-center text-muted-foreground text-sm">

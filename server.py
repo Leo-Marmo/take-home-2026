@@ -1,4 +1,5 @@
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -8,21 +9,10 @@ from models import Product, ProductSummary
 
 OUTPUT_DIR = Path(__file__).parent / "data" / "output"
 
-app = FastAPI(title="Channel3 Product API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["GET"],
-    allow_headers=["*"],
-)
-
-# Load all products at startup
 _products: dict[str, ProductSummary] = {}
 
 
-@app.on_event("startup")
-def load_products() -> None:
+def _load_products() -> None:
     for path in sorted(OUTPUT_DIR.glob("*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -30,8 +20,23 @@ def load_products() -> None:
             _products[path.stem] = ProductSummary(id=path.stem, product=product)
         except Exception as e:
             print(f"[server] Skipping {path.name}: {e}")
-
     print(f"[server] Loaded {len(_products)} products: {', '.join(_products)}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _load_products()
+    yield
+
+
+app = FastAPI(title="Channel3 Product API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/products", response_model=list[ProductSummary])

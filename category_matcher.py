@@ -71,7 +71,9 @@ _SYNONYMS: dict[str, str] = {
     "trousers": "pants", "slacks": "pants", "chinos": "pants", "leggings": "pants",
     "tee": "shirt", "tshirt": "shirt", "henley": "shirt", "polo": "shirt", "blouse": "shirt",
     "sneakers": "shoes", "trainers": "shoes", "loafers": "shoes", "heels": "shoes",
+    "runner": "shoes", "runners": "shoes",      # e.g. "Tree Runner" → shoes
     "hoodie": "sweatshirt", "parka": "coat", "anorak": "jacket",
+    "shelf": "shelving", "shelves": "shelving",  # e.g. "Shelf unit" → Furniture > Shelving
     "toolkit": "tools", "sofa": "sofa", "couch": "sofa", "loveseat": "sofa", "armchair": "chair",
 }
 

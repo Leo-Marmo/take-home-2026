@@ -10,8 +10,11 @@ from bs4 import BeautifulSoup
 _IMAGE_EXTENSIONS = re.compile(r'\.(jpg|jpeg|png|webp|avif)(\?|$)', re.IGNORECASE)
 
 # URL fragments that indicate UI/chrome images — applied to all sources
+# _NNNx. is the Shopify embedded-size thumbnail suffix (e.g. _271x.png, _600x.jpg);
+# these appear in JSON-LD recommendation lists and <img> browse carousels, never in
+# the primary product JSON-LD image field which always points to the full-size asset.
 _NOISE_PATTERNS = re.compile(
-    r'(\.svg|/resources/|/icons?/|logo|favicon|spinner|loading|blank\.gif|analytics)',
+    r'(\.svg|/resources/|/icons?/|logo|favicon|spinner|loading|blank\.gif|no-image|-carousel-|_\d+x\.|analytics)',
     re.IGNORECASE,
 )
 
@@ -86,9 +89,52 @@ def preprocess(html: str) -> str:
     )
 
     # --- 2. Build [STRUCTURED DATA] from JSON-LD and microdata ---
+    # Only keep Product/ProductGroup blocks — BreadcrumbList, 3DModel, WebSite,
+    # FAQPage, etc. add no extraction signal and waste tokens.
+    # Keep only the FIRST qualifying block: the primary product is always listed
+    # first; subsequent blocks are related/upsell products injected by the page.
+    _PRODUCT_TYPES = {"Product", "ProductGroup"}
+    # Keys that add no extraction signal and can be large (reviews, ratings).
+    _STRIP_KEYS = {"review", "aggregateRating"}
+
+    def _clean_product_block(item: dict) -> dict:
+        cleaned = {k: v for k, v in item.items() if k not in _STRIP_KEYS}
+        # Remove noise placeholder image URLs from the structured data dump so
+        # the LLM doesn't copy them into image_urls.
+        for img_key in ("image", "images"):
+            if img_key not in cleaned:
+                continue
+            val = cleaned[img_key]
+            if isinstance(val, str) and _NOISE_PATTERNS.search(val):
+                del cleaned[img_key]
+            elif isinstance(val, list):
+                filtered = [v for v in val if not (isinstance(v, str) and _NOISE_PATTERNS.search(v))]
+                if filtered:
+                    cleaned[img_key] = filtered
+                else:
+                    del cleaned[img_key]
+        # Trim hasVariant to entries with actual data — URL-only stubs
+        # ({"@type": "Product", "url": "..."}) carry no useful information.
+        if "hasVariant" in cleaned:
+            rich_variants = [
+                v for v in cleaned["hasVariant"]
+                if isinstance(v, dict) and len(v) > 2
+            ]
+            if rich_variants:
+                cleaned["hasVariant"] = rich_variants
+            else:
+                del cleaned["hasVariant"]
+        return cleaned
+
     structured_blocks = []
     for item in extracted.get("json-ld", []) + extracted.get("microdata", []):
-        structured_blocks.append(json.dumps(item, indent=2))
+        item_type = item.get("@type", "")
+        if isinstance(item_type, list):
+            item_type = item_type[0] if item_type else ""
+        if item_type not in _PRODUCT_TYPES:
+            continue
+        structured_blocks.append(json.dumps(_clean_product_block(item), indent=2))
+        break  # primary product is always first; skip related/upsell blocks
 
     # --- 3. Walk structured data recursively for image URLs ---
     structured_image_urls: list[str] = []
@@ -197,9 +243,10 @@ def preprocess(html: str) -> str:
         srcset = img.get("srcset", "").strip()
         if srcset:
             for part in srcset.split(","):
-                raw = part.strip().split()[0]
-                if not raw:
+                tokens = part.strip().split()
+                if not tokens:
                     continue
+                raw = tokens[0]
                 url = _normalize_url(raw)
                 if _is_product_image(url) and url not in seen:
                     seen.add(url)
