@@ -1,14 +1,14 @@
 """
 Matches a product payload to the closest Google Product Taxonomy categories
-using a pre-computed embedding index (category_embeddings.npz).
+using a hybrid of word-overlap scoring and semantic embeddings.
 
-The index is built once by generate_embeddings.py and committed to the repo.
-At runtime CategoryMatcher loads the index on first instantiation, encodes
-the product name/description as a query vector, and returns the top-N
-categories by cosine similarity.
+Word-overlap runs first using a synonym table that maps product-world terms
+(tee, trousers, runner) to taxonomy-world terms (shirt, pants, shoes). Its
+results are merged with the top-N categories from a pre-computed embedding
+index (category_embeddings.npz), giving the LLM candidates from both signals.
 
-Falls back to word-overlap scoring when the index file is missing, so the
-pipeline degrades gracefully without the index.
+The embedding index is built once by scripts/generate_embeddings.py. When the
+index is not present, the matcher falls back to word-overlap only.
 """
 
 import json
@@ -71,9 +71,9 @@ _SYNONYMS: dict[str, str] = {
     "trousers": "pants", "slacks": "pants", "chinos": "pants", "leggings": "pants",
     "tee": "shirt", "tshirt": "shirt", "henley": "shirt", "polo": "shirt", "blouse": "shirt",
     "sneakers": "shoes", "trainers": "shoes", "loafers": "shoes", "heels": "shoes",
-    "runner": "shoes", "runners": "shoes",      # e.g. "Tree Runner" → shoes
+    "runner": "shoes", "runners": "shoes",
     "hoodie": "sweatshirt", "parka": "coat", "anorak": "jacket",
-    "shelf": "shelving", "shelves": "shelving",  # e.g. "Shelf unit" → Furniture > Shelving
+    "shelf": "shelving", "shelves": "shelving", 
     "toolkit": "tools", "sofa": "sofa", "couch": "sofa", "loveseat": "sofa", "armchair": "chair",
 }
 
@@ -147,7 +147,7 @@ class CategoryMatcher:
         else:
             warnings.warn(
                 f"Embedding index not found at {_INDEX_PATH}. "
-                "Run generate_embeddings.py to build it. Falling back to word-overlap matching.",
+                "Run scripts/generate_embeddings.py to build it. Falling back to word-overlap matching.",
                 stacklevel=2,
             )
 
@@ -165,24 +165,16 @@ class CategoryMatcher:
             self._embeddings.shape[1],
         )
 
-    # Minimum word-overlap score to consider the lexical signal reliable.
-    # If the best-scoring category exceeds this threshold, word-overlap results
-    # are used directly. Below the threshold (opaque names like "Air Max 90"
-    # with zero lexical overlap), embeddings take over.
-    _OVERLAP_THRESHOLD = 0.1
-
     def match(self, payload: str, n: int = MAX_RESULTS) -> list[str]:
         """
         Return the top n taxonomy categories most relevant to the payload.
 
         Strategy:
-        - Word-overlap is used when it finds any lexical signal (score ≥ threshold).
-          It correctly handles synonyms (tee → shirt, sneakers → shoes) and
-          is not misled by incidental words in descriptions (e.g. "cotton" → Cotton Balls).
-        - Embeddings are used as a fallback for opaque product names (e.g. "Air Max 90")
-          where there is no keyword overlap with any taxonomy category.
-
-        Falls back to word-overlap-only when the embedding index is not present.
+        - Both word-overlap and embeddings run independently and their results
+          are merged. Word-overlap candidates appear first (they're more precise
+          for known synonym patterns), followed by any additional categories
+          surfaced by embeddings that weren't already in the overlap set.
+        - Falls back to word-overlap-only when the embedding index is not present.
 
         Args:
             payload: preprocessed product page text (output of preprocessor.preprocess)
@@ -195,15 +187,17 @@ class CategoryMatcher:
             return []
 
         overlap_results = self._match_word_overlap(payload, n)
-        if overlap_results:
-            # Check whether the best overlap score clears the threshold.
-            # _match_word_overlap already filters out score==0 results, so
-            # any non-empty list means at least some lexical signal was found.
-            candidates = overlap_results
-        elif self._use_embeddings:
-            # No lexical signal at all — fall back to semantic embeddings.
-            candidates = self._match_embeddings(payload, n)
+
+        if self._use_embeddings:
+            embedding_results = self._match_embeddings(payload, n)
+            # Merge: word-overlap first, then any embedding results not already present
+            seen = set(overlap_results)
+            combined = overlap_results + [c for c in embedding_results if c not in seen]
+            candidates = combined[:n]
         else:
+            candidates = overlap_results
+
+        if not candidates:
             return []
 
         return self._drop_superseded_parents(candidates)

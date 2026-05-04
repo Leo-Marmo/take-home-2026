@@ -39,7 +39,7 @@ def _get_client() -> AsyncOpenAI:
 
 
 def _log_usage(response) -> None:
-    """Log token usage and cost extrapolation for 1M queries."""
+    """Log token usage and cost extrapolations for 1M and 10M queries."""
     usage = getattr(response, "usage", None)
     if usage is None:
         logger.warning("No usage data in response")

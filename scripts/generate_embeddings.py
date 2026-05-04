@@ -5,7 +5,7 @@ pre-computed embedding index used by CategoryMatcher at runtime.
 Run once after cloning:
     uv run python generate_embeddings.py
 
-Output: category_embeddings.npz (~8 MB, committed to the repo)
+Output: category_embeddings.npz (~13 MB, gitignored — rebuild after cloning)
 """
 
 from pathlib import Path

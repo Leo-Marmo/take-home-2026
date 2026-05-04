@@ -50,13 +50,15 @@ async def test_extract_retries_on_first_failure():
 
 
 @pytest.mark.asyncio
-async def test_extract_returns_none_on_second_failure():
+async def test_extract_returns_none_after_all_retries():
+    from extractor import MAX_RETRIES
     error = Exception("LLM failed")
-    mock = AsyncMock(side_effect=[error, error])
+    total_attempts = MAX_RETRIES + 1
+    mock = AsyncMock(side_effect=[error] * total_attempts)
     with patch("extractor.ai.responses", new=mock):
         result = await extract(MINIMAL_HTML, "test")
     assert result is None
-    assert mock.call_count == 2
+    assert mock.call_count == total_attempts
 
 
 @pytest.mark.asyncio

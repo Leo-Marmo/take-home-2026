@@ -68,19 +68,23 @@ function VariantSelector({
 
   if (variants.length === 0 || optionNames.length === 0) return null
 
-  const selectedVariant = variants.find((v) =>
-    optionNames.every((name) => {
-      const sel = selections[name]
-      return !sel || v.options.some((o) => o.name === name && o.value === sel)
-    })
-  ) ?? null
+  const allSelected = optionNames.every((name) => !!selections[name])
+
+  const selectedVariant = allSelected
+    ? variants.find((v) =>
+        optionNames.every((name) => v.options.some((o) => o.name === name && o.value === selections[name]))
+      ) ?? null
+    : null
 
   const handleSelect = (optName: string, val: string) => {
     const next = { ...selections, [optName]: val }
     setSelections(next)
-    const matched = variants.find((v) =>
-      optionNames.every((name) => v.options.some((o) => o.name === name && o.value === next[name]))
-    )
+    const allNowSelected = optionNames.every((name) => !!next[name])
+    const matched = allNowSelected
+      ? variants.find((v) =>
+          optionNames.every((name) => v.options.some((o) => o.name === name && o.value === next[name]))
+        )
+      : null
     onPriceChange(matched?.price ?? null)
   }
 

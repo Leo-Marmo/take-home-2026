@@ -178,7 +178,7 @@ def preprocess(html: str) -> str:
     if next_data_tag:
         try:
             next_data = json.loads(next_data_tag.string or "")
-            # Always walk for images when structured data is sparse
+            # Walk for images when structured data images are sparse (fewer than 2 found)
             if len(structured_image_urls) < 2:
                 _walk_for_images(next_data, seen, next_data_image_urls)
             # Find and slim the product node for structured data

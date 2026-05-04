@@ -12,6 +12,7 @@ from preprocessor import preprocess
 logger = logging.getLogger(__name__)
 
 MODEL = "google/gemini-2.5-flash-lite"
+MAX_RETRIES = 2
 
 _category_matcher = CategoryMatcher()
 
@@ -69,7 +70,7 @@ async def extract(html: str, source: str) -> Product | None:
         source: identifier for logging (e.g. filename stem)
 
     Returns:
-        Product instance on success, None if extraction fails after retry
+        Product instance on success, None if all attempts fail
     """
     payload = preprocess(html)
     candidates = _category_matcher.match(payload)
@@ -81,34 +82,35 @@ async def extract(html: str, source: str) -> Product | None:
         {"role": "user", "content": user_message},
     ]
 
-    # First attempt
-    first_error = None
-    try:
-        return await ai.responses(model=MODEL, messages=messages, text_format=Product)
-    except Exception as e:
-        first_error = e
-        logger.warning(f"[{source}] First attempt failed: {e}")
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 2):
+        try:
+            return await ai.responses(model=MODEL, messages=messages, text_format=Product)
+        except Exception as e:
+            last_error = e
+            if attempt <= MAX_RETRIES:
+                logger.warning(f"[{source}] Attempt {attempt} failed: {e}")
+                messages.append({"role": "user", "content": RETRY_SUFFIX.format(error=str(e))})
+            else:
+                logger.error(f"[{source}] Failed after {MAX_RETRIES} retries, skipping: {e}")
 
-    # Retry with validation error hint
-    messages.append({"role": "user", "content": RETRY_SUFFIX.format(error=str(first_error))})
-    try:
-        return await ai.responses(model=MODEL, messages=messages, text_format=Product)
-    except Exception as e:
-        logger.error(f"[{source}] Second attempt failed, skipping: {e}")
-        return None
+    return None
 
 
-async def run(data_dir: Path) -> None:
+async def run(data_dir: Path, only: set[str] | None = None) -> None:
     """
     Extract Product data from all HTML files in data_dir and write JSON output.
 
     Args:
         data_dir: directory containing *.html product pages
+        only: if provided, restrict extraction to files whose stem is in this set
     """
     output_dir = data_dir / "output"
     output_dir.mkdir(exist_ok=True)
 
     html_files = list(data_dir.glob("*.html"))
+    if only:
+        html_files = [f for f in html_files if f.stem in only]
     if not html_files:
         logger.warning(f"No HTML files found in {data_dir}")
         return
@@ -136,5 +138,18 @@ async def run(data_dir: Path) -> None:
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO)
-    data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent / "data"
-    asyncio.run(run(data_dir))
+
+    args = sys.argv[1:]
+    only: set[str] = set()
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--only" and i + 1 < len(args):
+            only.add(Path(args[i + 1]).stem)
+            i += 2
+        else:
+            remaining.append(args[i])
+            i += 1
+
+    data_dir = Path(remaining[0]) if remaining else Path(__file__).parent / "data"
+    asyncio.run(run(data_dir, only=only or None))
